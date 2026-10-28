@@ -68,6 +68,7 @@ export class SnowLumaManager {
         this.wsUrl = process.env.SNOWLUMA_WS_URL || DEFAULT_WS_URL;
         this.httpUrl = String(this.options.httpUrl || process.env.SNOWLUMA_HTTP_URL || DEFAULT_HTTP_URL).replace(/\/+$/, '');
         this.token = this.options.accessToken || process.env.SNOWLUMA_TOKEN || '';
+        this.wsToken = process.env.SNOWLUMA_WS_TOKEN || '';
     }
 
     /** 开始连接：先发现端点，再建 WebSocket，并启动看门狗。 */
