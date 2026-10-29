@@ -1,4 +1,4 @@
-import { IsBoolean, IsOptional, IsString, ValidateNested } from 'class-validator';
+import { IsBoolean, IsInt, IsOptional, IsString, ValidateNested } from 'class-validator';
 import { Type } from 'class-transformer';
 
 /** 连接状态取值。 */
@@ -51,6 +51,34 @@ export class DshOptions {
     @IsOptional()
     @IsBoolean()
     allowRemote?: boolean
+
+    /** 等一次助手回复的超时（毫秒），默认 180 秒。 */
+    @IsOptional()
+    @IsInt()
+    replyTimeoutMs?: number
+
+    /** 新建会话时使用的智能体预设；留空用 DSH 默认预设。 */
+    @IsOptional()
+    @IsString()
+    agentPreset?: string
+
+    /** 工作区标题；只在这个工作区是首次创建时写入，不会覆盖用户改过的标题。 */
+    @IsOptional()
+    @IsString()
+    workspaceTitle?: string
+
+    /** 钉住会话的模型与推理强度：provider 与 model 都填了才生效。 */
+    @IsOptional()
+    @IsString()
+    provider?: string
+
+    @IsOptional()
+    @IsString()
+    model?: string
+
+    @IsOptional()
+    @IsString()
+    reasoningEffort?: string
 }
 
 /** POST /bridge/connect 请求体。 */

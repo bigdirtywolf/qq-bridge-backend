@@ -12,6 +12,7 @@
 import { Logger } from '../utils/log4js';
 import { requireWebSocket } from '../utils';
 import { ConnectionStatus, SnowLumaOptions, SnowLumaState } from '../dto/ConnectionDTO';
+import { QqMessage } from '../dto/BridgeDTO';
 import { discoverSnowLumaConnection } from '../utils/snowLumaConn';
 
 const DEFAULT_WS_URL = 'ws://127.0.0.1:3001';
@@ -23,8 +24,61 @@ const MIN_RETRY_MS = 5_000;
 const MAX_RETRY_MS = 60_000;
 /** 单次 OneBot action 的超时。 */
 const ACTION_TIMEOUT_MS = 8_000;
+/** 发送消息的超时（发消息走 HTTP API，不是 WS action）。 */
+const SEND_TIMEOUT_MS = 15_000;
 /** WebSocket 的 OPEN 状态码。 */
 const WS_OPEN = 1;
+
+/** 非文本消息段的占位文案：让模型知道「这里本来有东西」，而不是当成空消息。 */
+const SEGMENT_PLACEHOLDER: Record<string, string> = {
+    image: '[图片]',
+    face: '[表情]',
+    record: '[语音]',
+    video: '[视频]',
+    file: '[文件]',
+    json: '[卡片]',
+    music: '[音乐]',
+};
+
+/**
+ * 把 OneBot 消息体归一成纯文本，并判断是否 @ 了机器人。
+ *
+ * SnowLuma 可能给**两种形状**：消息段数组（`message`）或带 CQ 码的字符串（`raw_message`），
+ * 两种都要认，否则换一个 OneBot 实现对端就收不到内容了。
+ *
+ * @param message - 消息段数组（可能是字符串或 undefined）
+ * @param raw - raw_message 字符串
+ * @param selfId - 机器人自己的 QQ 号，用来识别 @
+ */
+function parseMessageBody(message: any, raw: any, selfId: string): { text: string; atMe: boolean } {
+    let atMe = false;
+
+    if (Array.isArray(message)) {
+        const parts: string[] = [];
+        for (const segment of message) {
+            const type = String(segment?.type ?? '');
+            if (type === 'text') {
+                parts.push(String(segment?.data?.text ?? ''));
+                continue;
+            }
+            if (type === 'at') {
+                const qq = String(segment?.data?.qq ?? '');
+                if (qq === 'all' || (selfId && qq === selfId)) atMe = true;
+                parts.push(`@${segment?.data?.name ?? qq}`);
+                continue;
+            }
+            // reply / poke 之类的段对模型没意义，直接丢掉。
+            if (type === 'reply' || type === 'poke') continue;
+            parts.push(SEGMENT_PLACEHOLDER[type] ?? `[${type}]`);
+        }
+        return { text: parts.join('').trim(), atMe };
+    }
+
+    const text = String(raw ?? '');
+    const matched = /\[CQ:at,qq=(all|\d+)\]/i.exec(text);
+    if (matched && (matched[1] === 'all' || (selfId && matched[1] === selfId))) atMe = true;
+    return { text: text.replace(/\[CQ:[^\]]*\]/g, '').trim(), atMe };
+}
 
 /** 令牌脱敏：接口与日志里都不出现完整令牌。 */
 function maskToken(token: string): string {
@@ -62,6 +116,11 @@ export class SnowLumaManager {
     private retryTimer: NodeJS.Timeout | null = null;
     private echoSeq = 0;
     private readonly pending = new Map<string, PendingAction>();
+    /** QQ 消息回调；由 BridgeService 注册，收到消息后在这里往上抛。 */
+    private messageHandler: ((message: QqMessage) => void) | null = null;
+    private lastMessageAt: number | null = null;
+    /** 端点/令牌刷新后的回调；BridgeService 用它把端点落盘给独立的 MCP server 进程。 */
+    private endpointHandler: ((endpoint: { httpUrl: string; token: string }) => void) | null = null;
 
     constructor(options: SnowLumaOptions = {}) {
         this.options = options ?? {};
@@ -115,6 +174,66 @@ export class SnowLumaManager {
         };
     }
 
+    /** 注册 QQ 消息回调（后注册的覆盖先前的）。 */
+    onMessage(handler: (message: QqMessage) => void): void {
+        this.messageHandler = handler;
+    }
+
+    /** 注册端点刷新回调（后注册的覆盖先前的）。 */
+    onEndpoint(handler: (endpoint: { httpUrl: string; token: string }) => void): void {
+        this.endpointHandler = handler;
+    }
+
+    /** 当前生效的 OneBot HTTP 端点（发消息与调动作都走它）。 */
+    getEndpoint(): { httpUrl: string; token: string } {
+        return { httpUrl: this.httpUrl, token: this.token };
+    }
+
+    /** 机器人自己的账号信息（判断是否 @ 了自己、忽略自己的消息都要用）。 */
+    getSelf(): { userId: string; nickname: string } | null {
+        return this.self;
+    }
+
+    /** 最近一次收到 QQ 消息的时间戳。 */
+    getLastMessageAt(): number | null {
+        return this.lastMessageAt;
+    }
+
+    /**
+     * 发一条 QQ 消息。
+     *
+     * 走 HTTP API 而不是 WS action：OneBot 的 HTTP 与 WS 是两套 token，
+     * 本模块已经持有可用的 HTTP token（自动发现出来的），直接复用最省事。
+     *
+     * @returns 上游返回的 message_id（取不到时返回 null）。
+     */
+    async sendMessage(kind: 'private' | 'group', id: string, text: string): Promise<string | null> {
+        const body = String(text ?? '');
+        if (!body.trim()) throw new Error('消息内容为空，已跳过发送');
+
+        const action = kind === 'group' ? 'send_group_msg' : 'send_private_msg';
+        const params = kind === 'group'
+            ? { group_id: Number(id), message: body }
+            : { user_id: Number(id), message: body };
+
+        const res = await fetch(`${this.httpUrl}/${action}`, {
+            method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                ...(this.token ? { authorization: `Bearer ${this.token}` } : {}),
+            },
+            body: JSON.stringify(params),
+            signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+        });
+        if (!res.ok) throw new Error(`发送失败：HTTP ${res.status}`);
+
+        const data: any = await res.json().catch(() => null);
+        if (!data || data.status !== 'ok' || data.retcode !== 0) {
+            throw new Error(`发送失败：${data?.status ?? '?'}/${data?.retcode ?? '?'} ${data?.wording ?? ''}`.trim());
+        }
+        return data?.data?.message_id === undefined ? null : String(data.data.message_id);
+    }
+
     private async connect(): Promise<void> {
         if (this.stopped || this.connecting || this.status === 'connected') return;
         this.connecting = true;
@@ -166,8 +285,19 @@ export class SnowLumaManager {
                 };
             }
             Logger.info(`[SnowLuma] 已发现端点（来源 ${this.source}）：${this.httpUrl} → ${this.wsUrl}`);
+            this.emitEndpoint();
         } catch (error) {
             this.lastError = (error as Error)?.message ?? String(error);
+        }
+    }
+
+    /** 把当前端点交给上层落盘（失败不影响连接本身）。 */
+    private emitEndpoint(): void {
+        if (!this.endpointHandler) return;
+        try {
+            this.endpointHandler(this.getEndpoint());
+        } catch (error) {
+            Logger.warn('[SnowLuma] 端点回调失败：', (error as Error)?.message ?? error);
         }
     }
 
@@ -194,6 +324,8 @@ export class SnowLumaManager {
         this.status = 'connected';
         this.updatedAt = Date.now();
         Logger.info(`[SnowLuma] 已连接：${this.wsUrl}${this.self ? `（${this.self.nickname} ${this.self.userId}）` : ''}`);
+        // 发现阶段失败但连接仍成功时也要落盘，否则独立进程拿不到端点。
+        this.emitEndpoint();
         void this.loadLoginInfo();
     }
 
@@ -244,6 +376,44 @@ export class SnowLumaManager {
                 if (this.heartbeatGood !== good) Logger.warn(`[SnowLuma] 上游接收链路 healthy=${good}`);
                 this.heartbeatGood = good;
             }
+            return;
+        }
+
+        if (message?.post_type === 'message') this.emitMessage(message);
+    }
+
+    /** 把一条 OneBot 消息事件归一化后交给上层（没注册回调时只记日志）。 */
+    private emitMessage(event: any): void {
+        const messageType = String(event?.message_type ?? '');
+        if (messageType !== 'private' && messageType !== 'group') return;
+
+        const selfId = String(this.self?.userId ?? event?.self_id ?? '');
+        const userId = String(messageType === 'group' ? (event?.sender?.user_id ?? event?.user_id ?? '') : (event?.user_id ?? ''));
+        const id = messageType === 'group' ? String(event?.group_id ?? '') : userId;
+        // 群里优先用群名片，其次昵称；私聊只有昵称。
+        const nickname = String((messageType === 'group' && event?.sender?.card) || event?.sender?.nickname || '');
+        const { text, atMe } = parseMessageBody(event?.message, event?.raw_message, selfId);
+
+        const message: QqMessage = {
+            kind: messageType,
+            id,
+            userId,
+            nickname,
+            text,
+            atMe,
+            messageId: event?.message_id === undefined ? null : String(event.message_id),
+            at: this.lastEventAt ?? Date.now(),
+        };
+        this.lastMessageAt = message.at;
+
+        if (!this.messageHandler) {
+            Logger.warn('[SnowLuma] 收到消息但没有处理者，已忽略');
+            return;
+        }
+        try {
+            this.messageHandler(message);
+        } catch (error) {
+            Logger.error('[SnowLuma] 处理消息失败：', (error as Error)?.message ?? error);
         }
     }
 
